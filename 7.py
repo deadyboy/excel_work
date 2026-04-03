@@ -228,15 +228,30 @@ else:
     df_all_tests = pd.DataFrame(columns=['患者ID', '所有检验'])
 
 # 6. 所有血培养
-# 血培养报告：样本类型名称含"血"且检验大类名称含"微生物"或"培养"
+# 策略：直接从检验报告元数据出发筛选血培养报告号，不依赖 df_merged（inner join 检验结果），
+#       避免遗漏仅有微生物结果而无常规检验项目的血培养报告。
+# 筛选条件：检验大类名称直接匹配"血培养"，
+#           或者（样本类型含"血" AND 检验大类含"微生物"或"培养"）。
 print(">>> 提取所有血培养...")
-blood_culture_mask = (
-    (df_merged['【检验报告.样本类型名称】'].astype(str).str.contains('血', na=False)) |
-    (df_merged['【检验报告.检验大类名称】'].astype(str).str.contains('血培养|微生物', na=False))
-)
-df_blood_culture_items = df_merged[blood_culture_mask].copy()
 
-# 同时关联微生物结果和药敏表
+blood_culture_report_mask = (
+    (df_report_meta['【检验报告.检验大类名称】'].astype(str).str.contains('血培养', na=False)) |
+    (
+        (df_report_meta['【检验报告.样本类型名称】'].astype(str).str.contains('血', na=False)) &
+        (df_report_meta['【检验报告.检验大类名称】'].astype(str).str.contains('微生物|培养', na=False))
+    )
+)
+df_bc_reports = df_report_meta[blood_culture_report_mask].copy()
+
+# 关联患者ID（从原始表中取检验报告号→患者ID映射）
+report_to_pid_bc = df[['患者ID', '【检验报告.检验报告号】']].dropna(
+    subset=['【检验报告.检验报告号】']).copy()
+report_to_pid_bc['【检验报告.检验报告号】'] = clean_id(report_to_pid_bc['【检验报告.检验报告号】'])
+report_to_pid_bc = report_to_pid_bc.drop_duplicates(subset=['【检验报告.检验报告号】'])
+
+df_bc_reports = pd.merge(df_bc_reports, report_to_pid_bc, on='【检验报告.检验报告号】', how='inner')
+
+# 准备微生物结果和药敏表（供血培养和药敏共用）
 microbio_result_cols = ['【检验微生物结果.检验报告号】', '【检验微生物结果.细菌项目名称】',
                          '【检验微生物结果.综合评价】']
 microbio_susc_cols = ['【检验微生物药敏.检验报告号】', '【检验微生物药敏.细菌项目代码】',
@@ -263,26 +278,37 @@ if available_microbio_susc_cols:
         df_microbio_susc['【检验微生物药敏.检验报告号】'])
     df_microbio_susc = df_microbio_susc.drop_duplicates()
 
-def build_blood_culture_for_patient(patient_items, df_microbio_result, df_microbio_susc):
-    """构建血培养JSON：含报告时间、常规检验结果、细菌鉴定、药敏"""
-    records = []
-    if patient_items.empty:
-        return None
-    for report_id, sub in patient_items.groupby('【检验报告.检验报告号】'):
-        time_val = sub['【检验报告.报告时间】'].iloc[0]
-        sample_type = sub['【检验报告.样本类型名称】'].iloc[0]
-        entry = {"时间": str(time_val), "样本类型": str(sample_type), "常规结果": {}}
+# 准备一个按报告号索引的常规检验结果查找表（left join，允许为空）
+# 注意：同一个报告号可能有多条检验结果项目，因此 index 允许重复，loc[[id]] 会正确返回所有行
+df_report_items_indexed = df_report_items.set_index('【检验结果.检验报告号】') if not df_report_items.empty else pd.DataFrame()
 
-        # 常规检验项目
-        for _, row in sub.iterrows():
-            item_name = str(row['【检验结果.检验项目中文名称】']).strip()
-            item_val = str(row['【检验结果.检验项目结果】']).strip()
-            item_unit = str(row['【检验结果.检验项目结果单位】']).strip()
-            if item_name and item_name.lower() != 'nan':
-                if item_unit and item_unit.lower() not in ['nan', 'none', '']:
-                    entry['常规结果'][item_name] = f"{item_val} {item_unit}"
-                else:
-                    entry['常规结果'][item_name] = item_val
+def build_blood_culture_for_patient(patient_reports, df_report_items_indexed, df_microbio_result, df_microbio_susc):
+    """构建血培养JSON：从检验报告出发，可选关联常规检验结果、细菌鉴定、药敏"""
+    records = []
+    if patient_reports.empty:
+        return None
+    for _, rpt_row in patient_reports.iterrows():
+        report_id = rpt_row['【检验报告.检验报告号】']
+        time_val = rpt_row['【检验报告.报告时间】']
+        sample_type = rpt_row['【检验报告.样本类型名称】']
+        category = rpt_row['【检验报告.检验大类名称】']
+        entry = {"时间": str(time_val), "样本类型": str(sample_type), "检验大类": str(category)}
+
+        # 常规检验项目（可能为空——纯微生物培养报告无常规项目）
+        routine_results = {}
+        if not df_report_items_indexed.empty and report_id in df_report_items_indexed.index:
+            items = df_report_items_indexed.loc[[report_id]]
+            for _, item_row in items.iterrows():
+                item_name = str(item_row['【检验结果.检验项目中文名称】']).strip()
+                item_val = str(item_row['【检验结果.检验项目结果】']).strip()
+                item_unit = str(item_row['【检验结果.检验项目结果单位】']).strip()
+                if item_name and item_name.lower() != 'nan':
+                    if item_unit and item_unit.lower() not in ['nan', 'none', '']:
+                        routine_results[item_name] = f"{item_val} {item_unit}"
+                    else:
+                        routine_results[item_name] = item_val
+        if routine_results:
+            entry['常规结果'] = routine_results
 
         # 微生物细菌鉴定结果
         if not df_microbio_result.empty and '【检验微生物结果.检验报告号】' in df_microbio_result.columns:
@@ -295,7 +321,8 @@ def build_blood_culture_for_patient(patient_items, df_microbio_result, df_microb
                 b_eval = str(br.get('【检验微生物结果.综合评价】', '')).strip()
                 if b_name and b_name.lower() != 'nan':
                     bacteria_list.append({"细菌": b_name, "综合评价": b_eval})
-            entry['细菌鉴定'] = bacteria_list
+            if bacteria_list:
+                entry['细菌鉴定'] = bacteria_list
 
         # 药敏结果
         if not df_microbio_susc.empty and '【检验微生物药敏.检验报告号】' in df_microbio_susc.columns:
@@ -309,15 +336,16 @@ def build_blood_culture_for_patient(patient_items, df_microbio_result, df_microb
                 result = str(sr.get('【检验微生物药敏.药敏结果】', '')).strip()
                 if drug and drug.lower() != 'nan':
                     susc_list.append({"药物": drug, "MIC": mic, "结果": result})
-            entry['药敏'] = susc_list
+            if susc_list:
+                entry['药敏'] = susc_list
 
         records.append(entry)
     return json.dumps(records, ensure_ascii=False, cls=NpEncoder) if records else None
 
-if not df_blood_culture_items.empty:
+if not df_bc_reports.empty:
     blood_culture_records = []
-    for pid, grp in df_blood_culture_items.groupby('患者ID'):
-        val = build_blood_culture_for_patient(grp, df_microbio_result, df_microbio_susc)
+    for pid, grp in df_bc_reports.groupby('患者ID'):
+        val = build_blood_culture_for_patient(grp, df_report_items_indexed, df_microbio_result, df_microbio_susc)
         if val:
             blood_culture_records.append({"患者ID": pid, "所有血培养": val})
     df_blood_culture = pd.DataFrame(blood_culture_records) if blood_culture_records else pd.DataFrame(columns=['患者ID', '所有血培养'])
